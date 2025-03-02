@@ -5,6 +5,7 @@ import random
 from merge_PermSpec_ResNet import mlp_permutation_spec
 from PermSpec_Base import PermutationSpec
 from tqdm import tqdm
+from tqdm.contrib.concurrent import thread_map
 
 def get_permuted_param(ps: PermutationSpec, perm, k: str, params, except_axis=None):
   """Get parameter `k` from `params`, with the permutations applied."""
@@ -28,7 +29,7 @@ def apply_permutation(ps: PermutationSpec, perm, params):
   """Apply a `perm` to `params`."""
   return {k: get_permuted_param(ps, perm, k, params) for k in params.keys() if "model_" not in k}
 
-def weight_matching(ps: PermutationSpec, params_a, params_b, special_layers=None, device="cpu", max_iter=3, init_perm=None, usefp16=False):
+def weight_matching(ps: PermutationSpec, params_a, params_b, special_layers=None, device="cpu", max_iter=10, init_perm=None, usefp16=False, workers=1):
   """Find a permutation of `params_b` to make them match `params_a`."""
   # tqdm layer will start from 1.
   
@@ -38,92 +39,118 @@ def weight_matching(ps: PermutationSpec, params_a, params_b, special_layers=None
   perm = {p: torch.arange(n) for p, n in perm_sizes.items()} if init_perm is None else init_perm
   special_layers = special_layers if special_layers and len(special_layers) > 0 else sorted(list(perm.keys()))
   #print(special_layers)
-  sum = 0
-  number = 0
+  sum_loss = 0.0 
+  sum_number = 0
+  EPS = 1e-12
 
-  if usefp16:
-    for _ in tqdm(range(max_iter), desc="weight_matching in fp16", position=1):
-      progress = False
-      random.shuffle(special_layers)
-      for p_ix in tqdm(special_layers, desc="weight_matching for special_layers", position=2):
-        p = p_ix
-        if p in special_layers:
-          n = perm_sizes[p]
-          A = torch.zeros((n, n), dtype=torch.float16).to(device)
-          for wk, axis in ps.perm_to_axes[p]:
-              w_a = params_a[wk]
-              w_b = get_permuted_param(ps, perm, wk, params_b, except_axis=axis)
-              w_a = torch.moveaxis(w_a, axis, 0).reshape((n, -1)).to(device)
-              w_b = torch.moveaxis(w_b, axis, 0).reshape((n, -1)).T.to(device)
-              A += torch.matmul(w_a.half(), w_b.half())
+  def make_increment_A_fp16(wk, axis, n):
+    w_a = params_a[wk]
+    w_b = get_permuted_param(ps, perm, wk, params_b, except_axis=axis)
+    w_a = torch.moveaxis(w_a, axis, 0).reshape((n, -1)).to(device)
+    w_b = torch.moveaxis(w_b, axis, 0).reshape((n, -1)).T.to(device)
+    #A += torch.matmul(w_a.half(), w_b.half())
+    return torch.matmul(w_a.half(), w_b.half())
 
-          A = A.cpu()
-          ri, ci = linear_sum_assignment(A.detach().numpy(), maximize=True)
+  def make_increment_A_fp32(wk, axis, n):
+    w_a = params_a[wk]
+    w_b = get_permuted_param(ps, perm, wk, params_b, except_axis=axis)
+    w_a = torch.moveaxis(w_a, axis, 0).reshape((n, -1)).to(device)
+    w_b = torch.moveaxis(w_b, axis, 0).reshape((n, -1)).T.to(device)
+    #A += torch.matmul(w_a.float(), w_b.float()).cpu()
+    return torch.matmul(w_a.float(), w_b.float()).cpu()
 
-          assert (torch.tensor(ri) == torch.arange(len(ri))).all()
-          
-          oldL = torch.vdot(torch.flatten(A).float(), torch.flatten(torch.eye(n)[perm[p].long()]).float()).half()
-          newL = torch.vdot(torch.flatten(A).float(), torch.flatten(torch.eye(n)[ci, :]).float()).half()
-          
-          if newL - oldL != 0:
-            sum += abs((newL-oldL).item())
-            number += 1
-            #print(f"{p}: {newL - oldL}")
+  def update_perm_fp16(p_ix):
+    progress = True
+    p = p_ix
+    loss = 0.0
+    number = 0
+    if p in special_layers:
+      n = perm_sizes[p]
+      iter_a = [make_increment_A_fp16(wk, axis, n) for wk, axis in ps.perm_to_axes[p]]
+      A = torch.stack(iter_a, dim=0).sum(dim=0).cpu()
 
-          progress = progress or newL > oldL + 1e-12
+      ri, ci = linear_sum_assignment(A.detach().numpy(), maximize=True)
 
-          perm[p] = torch.Tensor(ci)
-        
-      if not progress:
-        break
+      assert (torch.tensor(ri) == torch.arange(len(ri))).all()
+      
+      oldL = torch.vdot(torch.flatten(A).float(), torch.flatten(torch.eye(n)[perm[p].long()]).float()).half()
+      newL = torch.vdot(torch.flatten(A).float(), torch.flatten(torch.eye(n)[ci, :]).float()).half()
+      
+      if newL - oldL != 0:
+        #sum += abs((newL-oldL).item())
+        #number += 1
+        loss = abs((newL-oldL).item())
+        number = 1
+        #print(f"{p}: {newL - oldL}")
+
+      progress = progress or newL > oldL + EPS
+
+      perm[p] = torch.Tensor(ci)
+    return {
+      "progress": progress,
+      "loss": loss,
+      "number": number
+    }
+
+  def update_perm_fp32(p_ix):
+    progress = False
+    p = p_ix
+    loss = 0.0
+    number = 0
+    if p in special_layers:
+      n = perm_sizes[p]
+      iter_a = [make_increment_A_fp32(wk, axis, n) for wk, axis in ps.perm_to_axes[p]]
+      A = torch.stack(iter_a, dim=0).sum(dim=0).cpu()
+      ri, ci = linear_sum_assignment(A.detach().numpy(), maximize=True)
+
+      assert (torch.tensor(ri) == torch.arange(len(ri))).all()
     
-    if number > 0:
-      average = sum / number
-    else:
-      average = 0
-    return (perm, average)
+      oldL = torch.vdot(torch.flatten(A), torch.flatten(torch.eye(n)[perm[p].long()]).float())
+      newL = torch.vdot(torch.flatten(A), torch.flatten(torch.eye(n)[ci, :]).float())
 
+      if newL - oldL != 0:
+        #sum += abs((newL-oldL).item())
+        #number += 1
+        loss = abs((newL-oldL).item())
+        number = 1
+        #print(f"{p}: {newL - oldL}")
+
+      progress = progress or newL > oldL + EPS
+
+      perm[p] = torch.Tensor(ci)
+    return {
+      "progress": progress,
+      "loss": loss,
+      "number": number
+    }
+
+  pbar = tqdm(range(max_iter), desc="weight_matching", position=1)
+  for _ in pbar:
+    #progress = False
+    random.shuffle(special_layers)
+    perm_arr = []
+    if usefp16:
+      #for p_ix in tqdm(special_layers, desc="weight_matching for special_layers", position=2):
+      perm_arr = thread_map(update_perm_fp16, special_layers, desc="weight_matching for special_layers", position=2, max_workers=workers)
+    else:
+      perm_arr = thread_map(update_perm_fp32, special_layers, desc="weight_matching for special_layers", position=2, max_workers=workers)
+        
+    progress_arr = [d["progress"] for d in perm_arr]
+    sum_loss += sum([d["loss"] for d in perm_arr])
+    sum_number += sum([d["number"] for d in perm_arr])
+
+    pbar.set_postfix({'sum_loss': sum_loss, 'number': sum_number})
+
+    #if not progress:
+    if not (True in progress_arr):
+      break
+  
+  if sum_number > 0:
+    average = sum_loss / sum_number
   else:
-    for _ in tqdm(range(max_iter), desc="weight_matching in fp32", position=1):
-      progress = False
-      random.shuffle(special_layers)
-      for p_ix in tqdm(special_layers, desc="weight_matching for special_layers", position=2):
-        p = p_ix
-        if p in special_layers:
-          n = perm_sizes[p]
-          A = torch.zeros((n, n), dtype=torch.float32).to(device="cpu")
-          for wk, axis in ps.perm_to_axes[p]:
-            w_a = params_a[wk]
-            w_b = get_permuted_param(ps, perm, wk, params_b, except_axis=axis)
-            w_a = torch.moveaxis(w_a, axis, 0).reshape((n, -1)).to(device)
-            w_b = torch.moveaxis(w_b, axis, 0).reshape((n, -1)).T.to(device)
-            A += torch.matmul(w_a.float(), w_b.float()).cpu()
-
-          ri, ci = linear_sum_assignment(A.detach().numpy(), maximize=True)
-
-          assert (torch.tensor(ri) == torch.arange(len(ri))).all()
-        
-          oldL = torch.vdot(torch.flatten(A), torch.flatten(torch.eye(n)[perm[p].long()]).float())
-          newL = torch.vdot(torch.flatten(A), torch.flatten(torch.eye(n)[ci, :]).float())
-
-          if newL - oldL != 0:
-            sum += abs((newL-oldL).item())
-            number += 1
-            #print(f"{p}: {newL - oldL}")
-
-          progress = progress or newL > oldL + 1e-12
-
-          perm[p] = torch.Tensor(ci)
-        
-      if not progress:
-        break
-
-    if number > 0:
-      average = sum / number
-    else:
-      average = 0
-    return (perm, average)
-
+    average = 0
+  #pbar.set_postfix({'average': average})
+  return (perm, average)
 
 def test_weight_matching():
   """If we just have a single hidden layer then it should converge after just one step."""

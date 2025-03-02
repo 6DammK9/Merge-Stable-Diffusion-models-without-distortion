@@ -24,10 +24,12 @@ parser.add_argument("--safetensors", action='store_true', help="Save as safetens
 parser.add_argument("--ckpt", dest="safetensors", action='store_false', help="Save as ckpt", required=False)
 parser.add_argument("--prune", help="Pruning before merge", action='store_true', default=False, required=False)
 parser.add_argument("--fixclip", help="Force to fix clip to int64", action='store_true', default=False, required=False)
+parser.add_argument("--workers", type=int, default=None, help="Parallel for the weight matching. Need RAM.", required=False)
 parser.set_defaults(usefp16=True)
 args = parser.parse_args()   
 device = args.device
 usefp16 = args.usefp16 
+workers = args.workers
 
 if device == "cpu":
     usefp16 = False
@@ -102,7 +104,8 @@ else:
 
 checkpoint_dict_skip_on_merge = ["cond_stage_model.transformer.text_model.embeddings.position_ids"]
 
-for x in tqdm(range(iterations), desc="Main loop", position=0):
+pbar = tqdm(range(iterations), desc="Main loop", position=0)
+for x in pbar:
     #print(f"""
     #---------------------
     #     ITERATION {x+1}
@@ -137,12 +140,15 @@ for x in tqdm(range(iterations), desc="Main loop", position=0):
     #print("FINDING PERMUTATIONS")
 
     # Replace theta_0 with a permutated version using model A and B    
-    first_permutation, y = weight_matching(permutation_spec, model_a, theta_0, usefp16=usefp16, device=device)
+    first_permutation, y = weight_matching(permutation_spec, model_a, theta_0, usefp16=usefp16, device=device, workers=workers)
     theta_0 = apply_permutation(permutation_spec, first_permutation, theta_0)
-    second_permutation, z = weight_matching(permutation_spec, model_b, theta_0, usefp16=usefp16, device=device)
+    pbar.set_postfix({'y': y})
+    second_permutation, z = weight_matching(permutation_spec, model_b, theta_0, usefp16=usefp16, device=device, workers=workers)
     theta_3= apply_permutation(permutation_spec, second_permutation, theta_0)
+    pbar.set_postfix({'y': y, 'z': z})
 
     new_alpha = torch.nn.functional.normalize(torch.sigmoid(torch.Tensor([y, z])), p=1, dim=0).tolist()[0]
+    pbar.set_postfix({'new_alpha': new_alpha})
 
     # Weighted sum of the permutations
     

@@ -10,6 +10,13 @@ Download the code folder, open cmd in the directory, transfer the desired models
 If not in the same directory then 
 pathofmodela.ckpt and pathofmodelb.ckpt instead
 
+## Update on 250302 ##
+
+- *Personal work, not suitable for PR.*
+- Added **multithreading** to speed things up. 48 threads will speed up for around 6.75x. However it requries around 70GB of memory to merge.
+- **Completely abondon the GPU approach.** The `linear_sum_assignment` will not work in GPU, moving data before after `matmul` will stall everything.
+- Embedded original metrics (loss, iter etc) to the progress bar. *Would help analysis the algorithm.* 
+
 ### Notes for SDXL by DammK ###
 - Tested in A1111 WebUI 1.9.3 and [sd-mecha](https://github.com/ljleb/sd-mecha) 
 - [The SDXL code only permutates a few layers.](https://github.com/vladmandic/automatic/blob/dev/modules/merging/merge_rebasin.py)
@@ -22,14 +29,20 @@ pathofmodela.ckpt and pathofmodelb.ckpt instead
 - **~~Bonus task (probably impossible): Implement Algorithm 3 MERGEMANY~~** Probably infeasible, even with [sd-mecha](https://github.com/ljleb/sd-mecha/tree/main)'s well structured codebase. This implementation requires its own layer loading structre for iterlation. 
 
 ```sh
-python SD_rebasin_merge.py --model_a _211-Replicant-V3.0_fp16.safetensors --model_b _220-realgarV20V21V21Yuri_v21.safetensors
+python SD_rebasin_merge.py --model_a _x001-sd_xl_base_1.0.safetensors --model_b amp-AstolfoMix-25022801-1458190.safetensors --workers=48
 ```
 
 - **SDXL will takes hours to merge! 6 minutes per permutation!** Default model name will be `merged.safetensors`.
 ```log
-weight_matching in fp32:  33%|██████████████████▎                                    | 1/3 [12:07<24:15, 727.52s/it] 
-Applying weighted_sum to special_keys: 100%|████████████████████████████████████████| 6/6 [00:00<00:00, 6009.03it/s] 
-Main loop: 100%|████████████████████████████████████████████████████████████████| 10/10 [3:47:06<00:00, 1362.64s/it]
+Applying weighted_sum to theta: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████| 2515/2515 [00:49<00:00, 51.33it/s]
+weight_matching for special_layers: 100%|█████████████████████████████████████████████████████████████████████████████████████████████| 1498/1498 [01:12<00:00, 20.60it/s] 
+weight_matching for special_layers: 100%|█████████████████████████████████████████████████████████████████████████████████████████████| 1498/1498 [01:24<00:00, 17.71it/s]
+weight_matching in fp32:  33%|██████████████████████████████████████████████████                                                      | 1/3 [02:38<05:16, 158.01s/it]
+weight_matching for special_layers: 100%|█████████████████████████████████████████████████████████████████████████████████████████████| 1498/1498 [01:25<00:00, 17.53it/s]
+weight_matching for special_layers: 100%|█████████████████████████████████████████████████████████████████████████████████████████████| 1498/1498 [01:11<00:00, 21.01it/s]
+weight_matching in fp32:  33%|██████████████████████████████████████████████████                                                      | 1/3 [02:37<05:14, 157.23s/it]
+Applying weighted_sum to special_keys: 100%|██████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<?, ?it/s]
+Main loop: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 10/10 [1:19:05<00:00, 474.56s/it]
 
 Saving...
 Done!
@@ -42,3 +55,7 @@ Done!
 ![xyz_grid-0841-740330577-8064-1623-3-48-20240428123657.jpg](docs/xyz_grid-0841-740330577-8064-1623-3-48-20240428123657.jpg)
 ![xyz_grid-0842-740330577-8064-1623-3-48-20240428125432.jpg](docs/xyz_grid-0842-740330577-8064-1623-3-48-20240428125432.jpg)
 
+- Result by revisiting the merge (`x215b` and `x255b`):
+
+![xyz_grid-0000-3501057452-9408-1081-6-48-20250302224301.jpg](docs/xyz_grid-0000-3501057452-9408-1081-6-48-20250302224301.jpg)
+![xyz_grid-0001-744089893-9408-1081-6-48-20250302230521.jpg](docs/xyz_grid-0001-744089893-9408-1081-6-48-20250302230521.jpg)
